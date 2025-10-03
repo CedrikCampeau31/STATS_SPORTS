@@ -1,0 +1,16 @@
+# config.yaml
+seed: 42
+task: "classification"
+objective: "maximize:F1_macro"
+
+data:
+  train_path: "data/train.csv"
+  val_path: "data/val.csv"
+  target: "label"
+
+train:
+  lr: 0.0003
+  batch_size: 64
+  max_epochs: 20
+  weight_decay: 0.0
+  early_stopping_patience: 3
