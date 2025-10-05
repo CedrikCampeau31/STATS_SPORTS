@@ -1,0 +1,12 @@
+seed: 42
+objective: "maximize:F1_macro"
+
+data:
+  train_path: "STATS_NHL_ALL_19_25.xlsx"
+  target: ""   # laisse vide si tu veux l'auto-détection; sinon mets le nom exact de ta colonne cible
+
+train:
+  lr: 0.0003
+  batch_size: 64
+  weight_decay: 0.0
+  early_stopping_patience: 3
