@@ -5,9 +5,9 @@ import os, re, json
 import numpy as np
 import pandas as pd
 
-# ============
-# 0) CONFIG
-# ============
+# ============ #
+# 0) CONFIG    #
+# ============ #
 DATA_LOCAL = os.path.join("data", "STATS_NHL_ALL_19_25.xlsx")
 DATA_FALLBACK_URL = "https://raw.githubusercontent.com/CedrikCampeau31/STATS_SPORTS/main/STATS_NHL_ALL_19_25.xlsx"
 SHEET = 0
@@ -16,20 +16,18 @@ SKIPROWS = 1
 BASE_MODELS = os.path.join("artifacts_models")
 os.makedirs(BASE_MODELS, exist_ok=True)
 
-# ============
-# 1) LOAD
-# ============
+# ============ #
+# 1) LOAD      #
+# ============ #
 def load_df():
     path = DATA_LOCAL if os.path.exists(DATA_LOCAL) else DATA_FALLBACK_URL
     print(f"[LOAD] {path}")
     df_raw = pd.read_excel(path, sheet_name=SHEET, skiprows=SKIPROWS, engine="openpyxl")
     return df_raw.copy()
 
-# ============
-# 2) CLEAN & FEATURE ENGINEERING (condensé de ton notebook)
-# ============
-import re
-
+# ========================================= #
+# 2) CLEAN & FEATURE ENGINEERING (condensé) #
+# ========================================= #
 RENAME = {
     "Rk":"rank","Name":"playerName","Team":"team","Age":"age","Pos":"pos",
     "GP":"gp","G":"g","A":"a","P":"pts","PIM":"pim","+/-":"pm","TOI":"toi",
@@ -52,8 +50,6 @@ KEEP = [
 ]
 
 def toi_to_minutes(x):
-    import numpy as np
-    import pandas as pd
     if pd.isna(x): return np.nan
     if isinstance(x, (int, float)): return float(x)
     s = str(x)
@@ -77,18 +73,23 @@ def _find_col(df, candidates):
 def ensure_season_cols(df):
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
+
     season_col = _find_col(df, ['seasonId','season_id','season','Season'])
     if season_col is None:
         raise ValueError("Pas de colonne saison trouvée.")
     if season_col != 'seasonId':
         df = df.rename(columns={season_col: 'seasonId'})
-    try:
-        df['seasonId'] = pd.to_numeric(df['seasonId'], errors='ignore')
-    except Exception:
-        pass
+
+    # Conversion sûre (évite FutureWarning et les formats '2021-22')
+    if not pd.api.types.is_numeric_dtype(df['seasonId']):
+        s = df['seasonId'].astype(str)
+        if s.str.fullmatch(r'\d+').all():
+            df['seasonId'] = pd.to_numeric(s, errors='coerce')
+
     player_col = _find_col(df, ['playerId','player_id','skaterId','nhlId','playerName','Name','name','player'])
     if player_col is None:
         raise ValueError("Pas de colonne identifiant joueur (playerName/Name/...).")
+
     df = df.sort_values([player_col, 'seasonId'])
     if 'seasonId_prev' not in df.columns:
         df['seasonId_prev'] = df.groupby(player_col)['seasonId'].shift(1)
@@ -99,7 +100,9 @@ def prepare_df(df_raw):
     df = df[[c for c in KEEP if c in df.columns]].copy()
 
     if 'seasonId' in df.columns:
-        df['seasonId'] = df['seasonId'].fillna(0).astype(int)
+        # si déjà numérique => cast int, sinon laisse tel quel
+        if pd.api.types.is_numeric_dtype(df['seasonId']):
+            df['seasonId'] = df['seasonId'].fillna(0).astype(int)
 
     for pct in ["sh_pct","fo_pct","ppp_pct"]:
         if pct in df.columns:
@@ -133,9 +136,9 @@ def prepare_df(df_raw):
     df["team_id"] = df["team"].astype("category").cat.codes
     return df
 
-# ============
-# 3) ML t-1 → t (reprend ton Bloc 6 compacté)
-# ============
+# =========================== #
+# 3) ML t-1 → t (Bloc 6)      #
+# =========================== #
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.cluster import KMeans
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -145,8 +148,6 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 FEATURES_BASE = ['p_pergp','esp','a','p_per60','ppp','a_per60','gwp','esa','g','shots']
 RANDOM_STATE = 42
-MIN_N_SEG = 50
-MIN_N_MACRO = 100
 
 def macro_position(pos_str):
     if pd.isna(pos_str): return "UNK"
@@ -196,12 +197,15 @@ def metrics(y_true, y_pred):
 
 def run_training(df):
     df_t = build_tminus1_to_t(df).copy()
+
     feat_prev_all = [f"{c}_prev" for c in FEATURES_BASE if f"{c}_prev" in df_t.columns]
     if not feat_prev_all:
         raise ValueError("Aucune feature *_prev disponible.")
+
     for c in feat_prev_all + ["pts_target","pts_prev","age_prev","toi_min_total_prev"]:
         if c in df_t.columns:
             df_t[c] = pd.to_numeric(df_t[c], errors="coerce")
+
     df_t["macro_pos"] = df_t.get("pos_prev", df_t.get("pos", np.nan)).apply(macro_position)
 
     if "pts_prev" not in df_t.columns:
