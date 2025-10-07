@@ -4,9 +4,15 @@ import argparse
 import json
 import os
 import re
+import warnings
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # ============ #
 # 0) CONFIG    #
@@ -20,6 +26,12 @@ SKIPROWS = 1
 
 BASE_MODELS = os.path.join("artifacts_models")
 os.makedirs(BASE_MODELS, exist_ok=True)
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+FEATURES_BASE = ["p_pergp", "esp", "a", "p_per60", "ppp", "a_per60", "gwp", "esa", "g", "shots"]
+RANDOM_STATE = 42
+args = None  # rempli par argparse
 
 
 # ============ #
@@ -265,21 +277,6 @@ def prepare_df(df_raw):
 # =========================== #
 # 3) ML t-1 → t (Bloc 6)      #
 # =========================== #
-import warnings
-
-from sklearn.cluster import KMeans
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
-
-FEATURES_BASE = ["p_pergp", "esp", "a", "p_per60", "ppp", "a_per60", "gwp", "esa", "g", "shots"]
-RANDOM_STATE = 42
-args = None  # rempli par argparse
-
-
 def macro_position(pos_str):
     if pd.isna(pos_str):
         return "UNK"
@@ -388,23 +385,10 @@ def run_training(df):
     df_t = build_tminus1_to_t(df).copy()
 
     feat_prev_all = [f"{c}_prev" for c in FEATURES_BASE if f"{c}_prev" in df_t.columns]
-
-    # engineered features
-    if {"pts_prev", "toi_min_total_prev"}.issubset(df_t.columns):
-        df_t["pts_prev_per60"] = 60.0 * df_t["pts_prev"] / df_t["toi_min_total_prev"].replace(
-            0, np.nan
-        )
-        df_t["pts_prev_per60"] = df_t["pts_prev_per60"].fillna(0)
-        if "pts_prev_per60" not in feat_prev_all:
-            feat_prev_all.append("pts_prev_per60")
-    if "age_prev" in df_t.columns:
-        df_t["age_prev2"] = df_t["age_prev"] ** 2
-        if "age_prev2" not in feat_prev_all:
-            feat_prev_all.append("age_prev2")
-
     if not feat_prev_all:
         raise ValueError("Aucune feature *_prev disponible.")
 
+    # cast numérique sûr pour colonnes critiques
     for c in feat_prev_all + ["pts_target", "pts_prev", "age_prev", "toi_min_total_prev"]:
         if c in df_t.columns:
             df_t[c] = pd.to_numeric(df_t[c], errors="coerce")
@@ -418,6 +402,20 @@ def run_training(df):
             )
         else:
             raise ValueError("Il manque 'pts_prev' et (g_prev,a_prev) pour le reconstruire.")
+
+    # --- engineered features ---
+    if {"pts_prev", "toi_min_total_prev"}.issubset(df_t.columns):
+        df_t["pts_prev_per60"] = (
+            60.0 * df_t["pts_prev"] / df_t["toi_min_total_prev"].replace(0, np.nan)
+        )
+        df_t["pts_prev_per60"] = df_t["pts_prev_per60"].fillna(0)
+        if "pts_prev_per60" not in feat_prev_all:
+            feat_prev_all.append("pts_prev_per60")
+
+    if "age_prev" in df_t.columns:
+        df_t["age_prev2"] = df_t["age_prev"] ** 2
+        if "age_prev2" not in feat_prev_all:
+            feat_prev_all.append("age_prev2")
 
     train_seasons, val_season, test_season = season_splits(df_t)
     m_train = df_t["seasonId"].isin(train_seasons)
@@ -481,7 +479,7 @@ def run_training(df):
                     df_t.loc[idx, "pts_target"].astype(float),
                 )
 
-    # base: meilleur modèle hiérarchique disponible
+    # base: prédiction d'un modèle donné (clé) pour une ligne
     def _pred_with_key(row, key):
         mdl = models.get(key)
         if mdl is None:
@@ -533,11 +531,11 @@ def run_training(df):
         print(f"[{split_name}] {m}")
         return m
 
-    # Val/Test (on garde simple ici; rolling + HP mini peuvent être ajoutés ultérieurement si besoin)
+    # Val/Test
     MET_VAL = export_eval(m_val, "val")
     MET_TEST = export_eval(m_test, "test")
 
-    # next season (skip in fast mode)
+    # next season (skip en mode fast)
     next_season = test_season + 101
     if not (args and args.fast):
         sub_next = df_t[df_t["seasonId"] == test_season].copy()
@@ -557,7 +555,15 @@ def run_training(df):
             else:
                 sub_next.loc[m_mp, "tier"] = "All"
         sub_next["y_pred"] = predict_rows(sub_next)
-        out_cols = ["playerName", "team_prev", "pos_prev", "macro_pos", "tier", "pts_prev", "y_pred"]
+        out_cols = [
+            "playerName",
+            "team_prev",
+            "pos_prev",
+            "macro_pos",
+            "tier",
+            "pts_prev",
+            "y_pred",
+        ]
         out_cols = [c for c in out_cols if c in sub_next.columns]
         sub_next["seasonId_pred"] = next_season
         sub_next[out_cols + ["seasonId_pred"]].to_csv(
