@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 
+import argparse
 import json
 import os
 import re
-import argparse  # <-- CLI
 
 import numpy as np
 import pandas as pd
@@ -183,7 +183,6 @@ def ensure_season_cols(df):
     if season_col != "seasonId":
         df = df.rename(columns={season_col: "seasonId"})
 
-    # Conversion sûre (évite FutureWarning et les formats '2021-22')
     if not pd.api.types.is_numeric_dtype(df["seasonId"]):
         s = df["seasonId"].astype(str)
         if s.str.fullmatch(r"\d+").all():
@@ -206,7 +205,6 @@ def prepare_df(df_raw):
     df = df[[c for c in KEEP if c in df.columns]].copy()
 
     if "seasonId" in df.columns:
-        # si déjà numérique => cast int, sinon laisse tel quel
         if pd.api.types.is_numeric_dtype(df["seasonId"]):
             df["seasonId"] = df["seasonId"].fillna(0).astype(int)
 
@@ -272,13 +270,14 @@ import warnings
 from sklearn.cluster import KMeans
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 FEATURES_BASE = ["p_pergp", "esp", "a", "p_per60", "ppp", "a_per60", "gwp", "esa", "g", "shots"]
 RANDOM_STATE = 42
-args = None  # rempli par la CLI
+args = None  # rempli par argparse
 
 
 def macro_position(pos_str):
@@ -386,10 +385,23 @@ def metrics(y_true, y_pred):
 
 
 def run_training(df):
-    global args, RANDOM_STATE
     df_t = build_tminus1_to_t(df).copy()
 
     feat_prev_all = [f"{c}_prev" for c in FEATURES_BASE if f"{c}_prev" in df_t.columns]
+
+    # engineered features
+    if {"pts_prev", "toi_min_total_prev"}.issubset(df_t.columns):
+        df_t["pts_prev_per60"] = 60.0 * df_t["pts_prev"] / df_t["toi_min_total_prev"].replace(
+            0, np.nan
+        )
+        df_t["pts_prev_per60"] = df_t["pts_prev_per60"].fillna(0)
+        if "pts_prev_per60" not in feat_prev_all:
+            feat_prev_all.append("pts_prev_per60")
+    if "age_prev" in df_t.columns:
+        df_t["age_prev2"] = df_t["age_prev"] ** 2
+        if "age_prev2" not in feat_prev_all:
+            feat_prev_all.append("age_prev2")
+
     if not feat_prev_all:
         raise ValueError("Aucune feature *_prev disponible.")
 
@@ -425,7 +437,7 @@ def run_training(df):
         km = KMeans(
             n_clusters=k,
             random_state=RANDOM_STATE,
-            n_init=(5 if args and args.fast else 10),  # <-- fast mode
+            n_init=(5 if args and args.fast else 10),
         ).fit(pts_train.reshape(-1, 1))
         tier_models[mp] = km
         tier_centers[mp] = km.cluster_centers_.flatten()
@@ -443,7 +455,7 @@ def run_training(df):
     y_tr = df_t.loc[m_train, "pts_target"].astype(float)
     models[("GLOBAL", "_")] = HistGradientBoostingRegressor(
         random_state=RANDOM_STATE,
-        max_iter=(args.max_iter if args else 100),  # <-- param CLI
+        max_iter=(args.max_iter if args else 100),
     ).fit(X_tr, y_tr)
 
     for mp in ["FWD", "DEF"]:
@@ -469,15 +481,32 @@ def run_training(df):
                     df_t.loc[idx, "pts_target"].astype(float),
                 )
 
+    # base: meilleur modèle hiérarchique disponible
+    def _pred_with_key(row, key):
+        mdl = models.get(key)
+        if mdl is None:
+            return np.nan
+        x = row[feat_prev_all].astype(float).fillna(0).to_frame().T
+        return mdl.predict(x)[0]
+
+    # stacking Ridge appris sur TRAIN
+    tmp = df_t.loc[m_train].copy()
+    G = [_pred_with_key(r, ("GLOBAL", "_")) for _, r in tmp.iterrows()]
+    M = [_pred_with_key(r, (r["macro_pos"], "_")) for _, r in tmp.iterrows()]
+    T = [_pred_with_key(r, (r["macro_pos"], r["tier"])) for _, r in tmp.iterrows()]
+    X_stack = np.nan_to_num(np.c_[G, M, T], nan=0.0)
+    y_stack = tmp["pts_target"].astype(float).values
+    ridge = Ridge(alpha=1.0, fit_intercept=False).fit(X_stack, y_stack)
+
     def predict_rows(sub):
-        preds = np.zeros(len(sub), dtype=float)
-        for i, (_, r) in enumerate(sub.iterrows()):
-            key = (r["macro_pos"], r["tier"])
-            key_macro = (r["macro_pos"], "_")
-            mdl = models.get(key) or models.get(key_macro) or models[("GLOBAL", "_")]
-            x = r[feat_prev_all].astype(float).fillna(0).to_frame().T
-            preds[i] = mdl.predict(x)[0]
-        return preds
+        rows = []
+        for _, r in sub.iterrows():
+            g = _pred_with_key(r, ("GLOBAL", "_"))
+            m = _pred_with_key(r, (r["macro_pos"], "_"))
+            t = _pred_with_key(r, (r["macro_pos"], r["tier"]))
+            rows.append([g, m, t])
+        Xc = np.nan_to_num(np.array(rows), nan=0.0)
+        return ridge.predict(Xc)
 
     def export_eval(mask, split_name):
         sub = df_t.loc[mask].copy()
@@ -504,12 +533,13 @@ def run_training(df):
         print(f"[{split_name}] {m}")
         return m
 
+    # Val/Test (on garde simple ici; rolling + HP mini peuvent être ajoutés ultérieurement si besoin)
     MET_VAL = export_eval(m_val, "val")
     MET_TEST = export_eval(m_test, "test")
 
-    # next season
+    # next season (skip in fast mode)
     next_season = test_season + 101
-    if not (args and args.fast):  # <-- skip en mode rapide
+    if not (args and args.fast):
         sub_next = df_t[df_t["seasonId"] == test_season].copy()
         if "age_prev" in sub_next.columns:
             sub_next["age_prev"] = pd.to_numeric(sub_next["age_prev"], errors="coerce") + 1
@@ -527,15 +557,7 @@ def run_training(df):
             else:
                 sub_next.loc[m_mp, "tier"] = "All"
         sub_next["y_pred"] = predict_rows(sub_next)
-        out_cols = [
-            "playerName",
-            "team_prev",
-            "pos_prev",
-            "macro_pos",
-            "tier",
-            "pts_prev",
-            "y_pred",
-        ]
+        out_cols = ["playerName", "team_prev", "pos_prev", "macro_pos", "tier", "pts_prev", "y_pred"]
         out_cols = [c for c in out_cols if c in sub_next.columns]
         sub_next["seasonId_pred"] = next_season
         sub_next[out_cols + ["seasonId_pred"]].to_csv(
@@ -552,13 +574,11 @@ def run_training(df):
 
 def main():
     global RANDOM_STATE, args
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-iter", type=int, default=100)
-    parser.add_argument(
-        "--fast", type=int, default=0, help="1 = mode rapide (moins d'itérations, pas de next)"
-    )
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max-iter", type=int, default=100)
+    p.add_argument("--fast", type=int, default=0)  # 1=rapide
+    args = p.parse_args()
     RANDOM_STATE = args.seed
 
     df_raw = load_df()
