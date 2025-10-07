@@ -1,15 +1,20 @@
-repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.8
-    hooks:
-      - id: ruff
-        args: [--fix]
-  - repo: https://github.com/psf/black
-    rev: 24.8.0
-    hooks:
-      - id: black
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
-    hooks:
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["data", "artifacts_*", "featuredselect", ".venv", "*.ipynb"]
+
+[tool.ruff.lint]
+# Qualité de base + isort etc., mais on ignore les règles qui font mal ici
+select = ["E", "F", "I", "B", "UP", "C90"]
+ignore = ["E501", "E701", "E702", "E402", "C901", "UP038", "B007"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

@@ -14,4 +14,3 @@ scikit-learn==1.5.1
 scipy==1.13.1
 matplotlib==3.8.4
 statsmodels==0.14.2
-
