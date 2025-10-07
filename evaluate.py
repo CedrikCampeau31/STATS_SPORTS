@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import argparse  # <-- CLI
 
 import numpy as np
 import pandas as pd
@@ -277,6 +278,7 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 FEATURES_BASE = ["p_pergp", "esp", "a", "p_per60", "ppp", "a_per60", "gwp", "esa", "g", "shots"]
 RANDOM_STATE = 42
+args = None  # rempli par la CLI
 
 
 def macro_position(pos_str):
@@ -384,6 +386,7 @@ def metrics(y_true, y_pred):
 
 
 def run_training(df):
+    global args, RANDOM_STATE
     df_t = build_tminus1_to_t(df).copy()
 
     feat_prev_all = [f"{c}_prev" for c in FEATURES_BASE if f"{c}_prev" in df_t.columns]
@@ -419,9 +422,11 @@ def run_training(df):
             tier_models[mp] = None
             tier_centers[mp] = np.array([np.nan])
             continue
-        km = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10).fit(
-            pts_train.reshape(-1, 1)
-        )
+        km = KMeans(
+            n_clusters=k,
+            random_state=RANDOM_STATE,
+            n_init=(5 if args and args.fast else 10),  # <-- fast mode
+        ).fit(pts_train.reshape(-1, 1))
         tier_models[mp] = km
         tier_centers[mp] = km.cluster_centers_.flatten()
         m_mp = df_t["macro_pos"] == mp
@@ -436,14 +441,18 @@ def run_training(df):
     models = {}
     X_tr = df_t.loc[m_train, feat_prev_all].astype(float).fillna(0)
     y_tr = df_t.loc[m_train, "pts_target"].astype(float)
-    models[("GLOBAL", "_")] = HistGradientBoostingRegressor(random_state=RANDOM_STATE).fit(
-        X_tr, y_tr
-    )
+    models[("GLOBAL", "_")] = HistGradientBoostingRegressor(
+        random_state=RANDOM_STATE,
+        max_iter=(args.max_iter if args else 100),  # <-- param CLI
+    ).fit(X_tr, y_tr)
 
     for mp in ["FWD", "DEF"]:
         idx = m_train & (df_t["macro_pos"] == mp)
         if idx.sum() >= 100:
-            models[(mp, "_")] = HistGradientBoostingRegressor(random_state=RANDOM_STATE).fit(
+            models[(mp, "_")] = HistGradientBoostingRegressor(
+                random_state=RANDOM_STATE,
+                max_iter=(args.max_iter if args else 100),
+            ).fit(
                 df_t.loc[idx, feat_prev_all].astype(float).fillna(0),
                 df_t.loc[idx, "pts_target"].astype(float),
             )
@@ -452,7 +461,10 @@ def run_training(df):
         for tname in tiers:
             idx = m_train & (df_t["macro_pos"] == mp) & (df_t["tier"] == tname)
             if idx.sum() >= 50:
-                models[(mp, tname)] = HistGradientBoostingRegressor(random_state=RANDOM_STATE).fit(
+                models[(mp, tname)] = HistGradientBoostingRegressor(
+                    random_state=RANDOM_STATE,
+                    max_iter=(args.max_iter if args else 100),
+                ).fit(
                     df_t.loc[idx, feat_prev_all].astype(float).fillna(0),
                     df_t.loc[idx, "pts_target"].astype(float),
                 )
@@ -497,29 +509,38 @@ def run_training(df):
 
     # next season
     next_season = test_season + 101
-    sub_next = df_t[df_t["seasonId"] == test_season].copy()
-    if "age_prev" in sub_next.columns:
-        sub_next["age_prev"] = pd.to_numeric(sub_next["age_prev"], errors="coerce") + 1
-    for mp in ["FWD", "DEF"]:
-        m_mp = sub_next["macro_pos"] == mp
-        if tier_models.get(mp) is not None:
-            km = tier_models[mp]
-            labs = km.predict(sub_next.loc[m_mp, "pts_prev"].fillna(0).values.reshape(-1, 1))
-            order = np.argsort(km.cluster_centers_.flatten())
-            mapping = {
-                cl: name
-                for cl, name in zip(order, ["Low", "Mid", "High"][: len(order)], strict=False)
-            }
-            sub_next.loc[m_mp, "tier"] = [mapping[i] for i in labs]
-        else:
-            sub_next.loc[m_mp, "tier"] = "All"
-    sub_next["y_pred"] = predict_rows(sub_next)
-    out_cols = ["playerName", "team_prev", "pos_prev", "macro_pos", "tier", "pts_prev", "y_pred"]
-    out_cols = [c for c in out_cols if c in sub_next.columns]
-    sub_next["seasonId_pred"] = next_season
-    sub_next[out_cols + ["seasonId_pred"]].to_csv(
-        os.path.join(BASE_MODELS, f"predictions_next_{next_season}.csv"), index=False
-    )
+    if not (args and args.fast):  # <-- skip en mode rapide
+        sub_next = df_t[df_t["seasonId"] == test_season].copy()
+        if "age_prev" in sub_next.columns:
+            sub_next["age_prev"] = pd.to_numeric(sub_next["age_prev"], errors="coerce") + 1
+        for mp in ["FWD", "DEF"]:
+            m_mp = sub_next["macro_pos"] == mp
+            if tier_models.get(mp) is not None:
+                km = tier_models[mp]
+                labs = km.predict(sub_next.loc[m_mp, "pts_prev"].fillna(0).values.reshape(-1, 1))
+                order = np.argsort(km.cluster_centers_.flatten())
+                mapping = {
+                    cl: name
+                    for cl, name in zip(order, ["Low", "Mid", "High"][: len(order)], strict=False)
+                }
+                sub_next.loc[m_mp, "tier"] = [mapping[i] for i in labs]
+            else:
+                sub_next.loc[m_mp, "tier"] = "All"
+        sub_next["y_pred"] = predict_rows(sub_next)
+        out_cols = [
+            "playerName",
+            "team_prev",
+            "pos_prev",
+            "macro_pos",
+            "tier",
+            "pts_prev",
+            "y_pred",
+        ]
+        out_cols = [c for c in out_cols if c in sub_next.columns]
+        sub_next["seasonId_pred"] = next_season
+        sub_next[out_cols + ["seasonId_pred"]].to_csv(
+            os.path.join(BASE_MODELS, f"predictions_next_{next_season}.csv"), index=False
+        )
 
     # results.json pour CI
     results = {"val": MET_VAL, "test": MET_TEST, "splits": {"next": int(next_season)}}
@@ -530,6 +551,16 @@ def run_training(df):
 
 
 def main():
+    global RANDOM_STATE, args
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-iter", type=int, default=100)
+    parser.add_argument(
+        "--fast", type=int, default=0, help="1 = mode rapide (moins d'itérations, pas de next)"
+    )
+    args = parser.parse_args()
+    RANDOM_STATE = args.seed
+
     df_raw = load_df()
     df = prepare_df(df_raw)
     print("[CLEAN] shape:", df.shape)
